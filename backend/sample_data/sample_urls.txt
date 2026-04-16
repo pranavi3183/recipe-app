@@ -1,0 +1,7 @@
+# Sample Recipe URLs Tested
+
+https://www.allrecipes.com/recipe/23891/grilled-cheese-sandwich/
+https://www.allrecipes.com/recipe/24074/alysons-broccoli-salad/
+https://www.bbcgoodfood.com/recipes/classic-margherita-pizza
+https://www.simplyrecipes.com/recipes/homemade_guacamole/
+https://www.seriouseats.com/the-best-slow-cooked-italian-american-tomato-sauce-red-sauce-recipe
