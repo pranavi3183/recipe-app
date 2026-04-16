@@ -10,14 +10,14 @@ A full-stack app that scrapes recipe blog URLs, extracts structured data using G
 |-----------|-----------------------------------|
 | Backend   | FastAPI + Uvicorn                 |
 | Database  | SQLite (via SQLAlchemy)           |
-| LLM       | Google Gemini 1.5 Flash (free)    |
+| LLM       | Google Gemini 3 Flash Preview     |
 | Scraping  | BeautifulSoup4 + requests         |
 | Frontend  | React + Vite                      |
 
 ---
 
 ## Project Structure
-
+ 
 ```
 recipe-app/
 ├── backend/
