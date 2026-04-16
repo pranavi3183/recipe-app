@@ -135,13 +135,23 @@ def _ensure_playwright_browsers() -> None:
     """Install Playwright browser binaries if they are not already present."""
     import subprocess
     import sys
+    from pathlib import Path
+
+    # Get the expected executable path and check it actually exists on disk
+    needs_install = False
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            # Probe whether the executable exists without launching
-            _ = p.chromium.executable_path
-    except Exception:
-        logger.info("Playwright browsers not found — running 'playwright install chromium'...")
+            exe = p.chromium.executable_path
+            if not Path(exe).exists():
+                logger.info("Playwright chromium binary missing at %s", exe)
+                needs_install = True
+    except Exception as e:
+        logger.info("Playwright probe raised: %s — will install", e)
+        needs_install = True
+
+    if needs_install:
+        logger.info("Running 'playwright install --with-deps chromium'...")
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
             capture_output=True,
@@ -149,7 +159,7 @@ def _ensure_playwright_browsers() -> None:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"playwright install failed:\n{result.stdout}\n{result.stderr}"
+                f"playwright install failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
             )
         logger.info("Playwright browser installation complete.")
 
