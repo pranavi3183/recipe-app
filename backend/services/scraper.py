@@ -151,9 +151,11 @@ def _ensure_playwright_browsers() -> None:
         needs_install = True
 
     if needs_install:
-        logger.info("Running 'playwright install --with-deps chromium'...")
+        # NOTE: --with-deps requires root (apt-get). At runtime we install browser only.
+        # System deps must be installed during the build step on Render.
+        logger.info("Running 'playwright install chromium' (no --with-deps, no root needed)...")
         result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "chromium"],
             capture_output=True,
             text=True,
         )
@@ -200,74 +202,102 @@ def _scrape_with_playwright(url: str, timeout: int = 15) -> BeautifulSoup:
     return BeautifulSoup(html, "lxml")
 
 
-def scrape_url(url: str, timeout: int = 15) -> str:
+def _fetch_html(url: str, timeout: int) -> BeautifulSoup:
     """
-    Fetches a URL and returns cleaned text content.
-
-    Strategy:
-    1. cloudscraper (handles Cloudflare JS challenges)
-    2. plain requests fallback
-    3. Playwright headless browser (when USE_PLAYWRIGHT=true and steps 1+2 fail with 4xx/5xx)
-    4. JSON-LD structured data, CSS selectors, full body text (content extraction)
-
-    Raises:
-        ValueError: For invalid URLs, HTTP errors, or non-HTML content.
+    Internal helper: tries ScraperAPI → cloudscraper → requests → Playwright
+    in order, returning a BeautifulSoup on the first success.
+    Raises ValueError if all attempts fail.
     """
-    # Basic URL validation
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("URL must start with http:// or https://")
-
     use_playwright = os.getenv("USE_PLAYWRIGHT", "false").lower() in ("1", "true", "yes")
+    scraper_api_key = os.getenv("SCRAPER_API_KEY", "").strip()
     soup = None
-    last_http_error: Optional[Exception] = None
+    last_err: Optional[Exception] = None
 
-    # Attempt 1: cloudscraper – handles Cloudflare / JS-challenge sites
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        response = scraper.get(url, headers=HEADERS, timeout=timeout)
-        response.raise_for_status()
-        logger.info("Fetched URL with cloudscraper (status %s)", response.status_code)
-        content_type = response.headers.get("Content-Type", "")
+    def _parse_response(resp: requests.Response, label: str) -> BeautifulSoup:
+        content_type = resp.headers.get("Content-Type", "")
         if "text/html" not in content_type and "text/plain" not in content_type:
-            raise ValueError(f"URL did not return HTML content (got: {content_type})")
-        soup = BeautifulSoup(response.text, "lxml")
-    except Exception as cs_err:
-        logger.warning("cloudscraper failed (%s), retrying with requests", cs_err)
-        last_http_error = cs_err
+            raise ValueError(f"URL did not return HTML (got: {content_type})")
+        logger.info("%s succeeded (status %s)", label, resp.status_code)
+        return BeautifulSoup(resp.text, "lxml")
 
-    # Attempt 2: plain requests with enhanced headers
+    # Attempt 1: ScraperAPI – handles anti-bot / 402 / 403 blocks via proxy
+    if scraper_api_key:
+        try:
+            proxy_url = (
+                f"http://api.scraperapi.com?api_key={scraper_api_key}"
+                f"&url={requests.utils.quote(url, safe='')}"
+                "&render=false"
+            )
+            resp = requests.get(proxy_url, timeout=timeout + 10)
+            resp.raise_for_status()
+            soup = _parse_response(resp, "ScraperAPI")
+        except Exception as e:
+            logger.warning("ScraperAPI failed (%s), trying cloudscraper", e)
+            last_err = e
+
+    # Attempt 2: cloudscraper – handles Cloudflare JS challenges
+    if soup is None:
+        try:
+            cs = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = cs.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            soup = _parse_response(resp, "cloudscraper")
+        except Exception as e:
+            logger.warning("cloudscraper failed (%s), retrying with requests", e)
+            last_err = e
+
+    # Attempt 3: plain requests with enhanced headers
     if soup is None:
         try:
             session = requests.Session()
             session.headers.update(HEADERS)
-            response = session.get(url, timeout=timeout, allow_redirects=True)
-            response.raise_for_status()
-            logger.info("Fetched URL with requests fallback (status %s)", response.status_code)
-            content_type = response.headers.get("Content-Type", "")
-            if "text/html" not in content_type and "text/plain" not in content_type:
-                raise ValueError(f"URL did not return HTML content (got: {content_type})")
-            soup = BeautifulSoup(response.text, "lxml")
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            soup = _parse_response(resp, "requests")
         except requests.exceptions.Timeout:
-            last_http_error = ValueError(f"Request timed out after {timeout}s for URL: {url}")
+            last_err = ValueError(f"Request timed out after {timeout}s for URL: {url}")
         except requests.exceptions.ConnectionError:
-            last_http_error = ValueError(f"Could not connect to URL: {url}")
-        except Exception as req_err:
-            logger.warning("requests fallback failed (%s)", req_err)
-            last_http_error = req_err
+            last_err = ValueError(f"Could not connect to URL: {url}")
+        except Exception as e:
+            logger.warning("requests fallback failed (%s)", e)
+            last_err = e
 
-    # Attempt 3: Playwright headless browser (opt-in via USE_PLAYWRIGHT=true)
+    # Attempt 4: Playwright headless browser (opt-in via USE_PLAYWRIGHT=true)
     if soup is None and use_playwright:
         try:
             soup = _scrape_with_playwright(url, timeout=timeout)
-        except Exception as pw_err:
-            logger.error("Playwright fallback failed: %s", pw_err)
+        except Exception as e:
+            logger.error("Playwright fallback failed: %s", e)
+            last_err = e
 
-    # All attempts exhausted
     if soup is None:
-        err_msg = str(last_http_error) if last_http_error else "All fetch attempts failed."
-        raise ValueError(err_msg)
+        raise ValueError(str(last_err) if last_err else "All fetch attempts failed.")
+
+    return soup
+
+
+def scrape_url(url: str, timeout: int = 15) -> str:
+    """
+    Fetches a URL and returns cleaned text content.
+
+    Fetch strategy (first success wins):
+    1. ScraperAPI proxy (if SCRAPER_API_KEY is set) — bypasses 402/403/anti-bot
+    2. cloudscraper — handles Cloudflare JS challenges
+    3. plain requests — standard HTTP
+    4. Playwright headless browser (if USE_PLAYWRIGHT=true)
+
+    Content extraction strategy:
+    1. JSON-LD structured data  2. CSS selectors  3. Full body text
+
+    Raises:
+        ValueError: For invalid URLs, HTTP errors, or non-HTML content.
+    """
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("URL must start with http:// or https://")
+
+    soup = _fetch_html(url, timeout)
 
     # --- Strategy 1: JSON-LD structured data (most reliable for recipe sites) ---
     extracted_text = _extract_jsonld_recipe(soup)

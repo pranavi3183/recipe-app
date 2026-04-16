@@ -11,8 +11,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: SCRAPER_API_KEY
+        sync: false     # set this in the Render dashboard
       - key: USE_PLAYWRIGHT
-        value: "true"
+        value: "false"
       - key: FRONTEND_URL
         sync: false     # set this in the Render dashboard
       - key: GEMINI_API_KEY

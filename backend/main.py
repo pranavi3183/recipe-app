@@ -50,6 +50,18 @@ def startup_event():
     create_tables()
     logger.info("Database ready.")
 
+    # ScraperAPI status
+    scraper_api_key = os.getenv("SCRAPER_API_KEY", "").strip()
+    if scraper_api_key:
+        logger.info("ScraperAPI: CONNECTED (key configured — anti-bot proxy active)")
+    else:
+        logger.warning("ScraperAPI: NOT configured — some sites (e.g. AllRecipes) may return 402. "
+                       "Set SCRAPER_API_KEY in .env to enable proxy fallback.")
+
+    # Playwright status
+    use_playwright = os.getenv("USE_PLAYWRIGHT", "false").lower() in ("1", "true", "yes")
+    logger.info("Playwright fallback: %s", "ENABLED" if use_playwright else "DISABLED")
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 app.include_router(recipe_router)
