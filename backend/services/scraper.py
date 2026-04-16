@@ -131,14 +131,50 @@ def _extract_jsonld_recipe(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _scrape_with_playwright(url: str, timeout: int = 15) -> BeautifulSoup:
+    """
+    Fetch a URL using a headless Chromium browser via Playwright.
+    Used as a fallback when HTTP-level fetches are blocked (e.g. 402/403).
+    Returns a BeautifulSoup object of the fully-rendered page.
+    """
+    from playwright.sync_api import sync_playwright
+
+    logger.info("Attempting Playwright browser fetch for URL: %s", url)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            user_agent=HEADERS.get("User-Agent"),
+            locale="en-US",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+        # Block image/font/media to speed up the load
+        page.route(
+            "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,mp4,mp3}",
+            lambda route: route.abort(),
+        )
+        page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+        # Wait a bit for dynamic JS content to settle
+        page.wait_for_timeout(2000)
+        html = page.content()
+        browser.close()
+
+    logger.info("Playwright browser fetch succeeded for URL: %s", url)
+    return BeautifulSoup(html, "lxml")
+
+
 def scrape_url(url: str, timeout: int = 15) -> str:
     """
     Fetches a URL and returns cleaned text content.
 
     Strategy:
-    1. JSON-LD structured data (schema.org/Recipe) – most reliable.
-    2. Targeted CSS selectors for recipe content blocks.
-    3. Full body text as last resort.
+    1. cloudscraper (handles Cloudflare JS challenges)
+    2. plain requests fallback
+    3. Playwright headless browser (when USE_PLAYWRIGHT=true and steps 1+2 fail with 4xx/5xx)
+    4. JSON-LD structured data, CSS selectors, full body text (content extraction)
 
     Raises:
         ValueError: For invalid URLs, HTTP errors, or non-HTML content.
@@ -147,64 +183,57 @@ def scrape_url(url: str, timeout: int = 15) -> str:
     if not url.startswith(("http://", "https://")):
         raise ValueError("URL must start with http:// or https://")
 
-    response = None
+    use_playwright = os.getenv("USE_PLAYWRIGHT", "false").lower() in ("1", "true", "yes")
+    soup = None
+    last_http_error: Optional[Exception] = None
 
-    # Attempt 1: cloudscraper – handles Cloudflare / JS-challenge sites (e.g. allrecipes)
+    # Attempt 1: cloudscraper – handles Cloudflare / JS-challenge sites
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
         response = scraper.get(url, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
-        logger.info("Fetched URL with cloudscraper")
-        if response.status_code != 200:
-            logger.warning("cloudscraper returned non-200 status: %s", response.status_code)
+        logger.info("Fetched URL with cloudscraper (status %s)", response.status_code)
+        content_type = response.headers.get("Content-Type", "")
+        if "text/html" not in content_type and "text/plain" not in content_type:
+            raise ValueError(f"URL did not return HTML content (got: {content_type})")
+        soup = BeautifulSoup(response.text, "lxml")
     except Exception as cs_err:
-        logger.warning(f"cloudscraper failed ({cs_err}), retrying with requests")
-        response = None
+        logger.warning("cloudscraper failed (%s), retrying with requests", cs_err)
+        last_http_error = cs_err
 
     # Attempt 2: plain requests with enhanced headers
-    if response is None:
+    if soup is None:
         try:
             session = requests.Session()
             session.headers.update(HEADERS)
             response = session.get(url, timeout=timeout, allow_redirects=True)
             response.raise_for_status()
-            logger.info("Fetched URL with requests fallback")
-            if response.status_code != 200:
-                logger.warning("requests returned non-200 status: %s", response.status_code)
+            logger.info("Fetched URL with requests fallback (status %s)", response.status_code)
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" not in content_type and "text/plain" not in content_type:
+                raise ValueError(f"URL did not return HTML content (got: {content_type})")
+            soup = BeautifulSoup(response.text, "lxml")
         except requests.exceptions.Timeout:
-            raise ValueError(f"Request timed out after {timeout}s for URL: {url}")
+            last_http_error = ValueError(f"Request timed out after {timeout}s for URL: {url}")
         except requests.exceptions.ConnectionError:
-            raise ValueError(f"Could not connect to URL: {url}")
-        except requests.exceptions.HTTPError as e:
-            raise ValueError(f"HTTP error {e.response.status_code} for URL: {url}")
+            last_http_error = ValueError(f"Could not connect to URL: {url}")
+        except Exception as req_err:
+            logger.warning("requests fallback failed (%s)", req_err)
+            last_http_error = req_err
 
-    # Check content type
-    content_type = response.headers.get("Content-Type", "")
-    if "text/html" not in content_type and "text/plain" not in content_type:
-        raise ValueError(f"URL did not return HTML content (got: {content_type})")
-
-    soup = BeautifulSoup(response.text, "lxml")
-
-    # If production fetches are blocked or non-HTML, optionally try a Playwright browser
-    use_playwright = os.getenv("USE_PLAYWRIGHT", "false").lower() in ("1", "true", "yes")
-    if use_playwright and (not response or response.status_code != 200 or "text/html" not in content_type):
+    # Attempt 3: Playwright headless browser (opt-in via USE_PLAYWRIGHT=true)
+    if soup is None and use_playwright:
         try:
-            from playwright.sync_api import sync_playwright
-
-            logger.info("Attempting Playwright fallback for URL: %s", url)
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-                context = browser.new_context(user_agent=HEADERS.get("User-Agent"))
-                page = context.new_page()
-                page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
-                pw_content = page.content()
-                browser.close()
-                soup = BeautifulSoup(pw_content, "lxml")
-                logger.info("Playwright fallback succeeded for URL: %s", url)
+            soup = _scrape_with_playwright(url, timeout=timeout)
         except Exception as pw_err:
-            logger.warning("Playwright fallback failed: %s", pw_err)
+            logger.error("Playwright fallback failed: %s", pw_err)
+
+    # All attempts exhausted
+    if soup is None:
+        err_msg = str(last_http_error) if last_http_error else "All fetch attempts failed."
+        raise ValueError(err_msg)
 
     # --- Strategy 1: JSON-LD structured data (most reliable for recipe sites) ---
     extracted_text = _extract_jsonld_recipe(soup)

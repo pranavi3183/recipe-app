@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: recipe-app-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python -m playwright install --with-deps chromium
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: USE_PLAYWRIGHT
+        value: "true"
+      - key: FRONTEND_URL
+        sync: false     # set this in the Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false     # set this in the Render dashboard
+      - key: DATABASE_URL
+        value: sqlite:///./recipes.db
+      - key: APP_HOST
+        value: "0.0.0.0"
+      - key: APP_PORT
+        value: "10000"
+      - key: DEBUG
+        value: "false"
