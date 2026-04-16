@@ -131,6 +131,29 @@ def _extract_jsonld_recipe(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _ensure_playwright_browsers() -> None:
+    """Install Playwright browser binaries if they are not already present."""
+    import subprocess
+    import sys
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # Probe whether the executable exists without launching
+            _ = p.chromium.executable_path
+    except Exception:
+        logger.info("Playwright browsers not found — running 'playwright install chromium'...")
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"playwright install failed:\n{result.stdout}\n{result.stderr}"
+            )
+        logger.info("Playwright browser installation complete.")
+
+
 def _scrape_with_playwright(url: str, timeout: int = 15) -> BeautifulSoup:
     """
     Fetch a URL using a headless Chromium browser via Playwright.
@@ -139,6 +162,7 @@ def _scrape_with_playwright(url: str, timeout: int = 15) -> BeautifulSoup:
     """
     from playwright.sync_api import sync_playwright
 
+    _ensure_playwright_browsers()
     logger.info("Attempting Playwright browser fetch for URL: %s", url)
     with sync_playwright() as p:
         browser = p.chromium.launch(
