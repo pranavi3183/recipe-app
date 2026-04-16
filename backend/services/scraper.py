@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 import re
 from typing import Optional
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ def scrape_url(url: str, timeout: int = 15) -> str:
         response = scraper.get(url, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
         logger.info("Fetched URL with cloudscraper")
+        if response.status_code != 200:
+            logger.warning("cloudscraper returned non-200 status: %s", response.status_code)
     except Exception as cs_err:
         logger.warning(f"cloudscraper failed ({cs_err}), retrying with requests")
         response = None
@@ -168,6 +171,8 @@ def scrape_url(url: str, timeout: int = 15) -> str:
             response = session.get(url, timeout=timeout, allow_redirects=True)
             response.raise_for_status()
             logger.info("Fetched URL with requests fallback")
+            if response.status_code != 200:
+                logger.warning("requests returned non-200 status: %s", response.status_code)
         except requests.exceptions.Timeout:
             raise ValueError(f"Request timed out after {timeout}s for URL: {url}")
         except requests.exceptions.ConnectionError:
@@ -181,6 +186,25 @@ def scrape_url(url: str, timeout: int = 15) -> str:
         raise ValueError(f"URL did not return HTML content (got: {content_type})")
 
     soup = BeautifulSoup(response.text, "lxml")
+
+    # If production fetches are blocked or non-HTML, optionally try a Playwright browser
+    use_playwright = os.getenv("USE_PLAYWRIGHT", "false").lower() in ("1", "true", "yes")
+    if use_playwright and (not response or response.status_code != 200 or "text/html" not in content_type):
+        try:
+            from playwright.sync_api import sync_playwright
+
+            logger.info("Attempting Playwright fallback for URL: %s", url)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                context = browser.new_context(user_agent=HEADERS.get("User-Agent"))
+                page = context.new_page()
+                page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+                pw_content = page.content()
+                browser.close()
+                soup = BeautifulSoup(pw_content, "lxml")
+                logger.info("Playwright fallback succeeded for URL: %s", url)
+        except Exception as pw_err:
+            logger.warning("Playwright fallback failed: %s", pw_err)
 
     # --- Strategy 1: JSON-LD structured data (most reliable for recipe sites) ---
     extracted_text = _extract_jsonld_recipe(soup)
